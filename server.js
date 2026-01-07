@@ -1,52 +1,70 @@
-// server.js
+require("dotenv").config();
 
-// ===== Imports =====
-const express = require('express');
-const mongoose = require('mongoose');
-const bodyParser = require('body-parser');
-const TelegramBot = require('node-telegram-bot-api');
-require('dotenv').config();
+const express = require("express");
+const mongoose = require("mongoose");
+const TelegramBot = require("node-telegram-bot-api");
 
-// ===== Initialize app =====
-const app = express();
-const PORT = process.env.PORT || 5000;
-
-// ===== Middleware =====
-app.use(bodyParser.json());
-
-// ===== Telegram Bot =====
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
-const chatId = process.env.CHAT_ID;
-
-// ===== MongoDB Connection =====
-const mongoURI = process.env.MONGO_URI; // Make sure you set MONGO_URI in .env
-mongoose
-  .connect(mongoURI)
-  .then(() => console.log("MongoDB connected ✅"))
-  .catch(err => console.log("MongoDB connection error ❌:", err));
-
-// ===== Models =====
 const WebhookPayload = require("./models/WebhookPayload");
 
-// ===== Routes =====
-app.post('/api/webhook', async (req, res) => {
+const app = express();
+app.use(express.json());
+
+// Telegram bot
+const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
+
+// MongoDB connection
+mongoose
+  .connect(process.env.MONGO_URI)
+  .then(() => console.log("MongoDB connected ✅"))
+  .catch((err) => console.error("MongoDB error ❌", err));
+
+// Health check
+app.get("/", (req, res) => {
+  res.send("SilentPing is running ✅");
+});
+
+// Webhook endpoint
+app.post("/api/webhook", async (req, res) => {
   try {
-    // Save payload to MongoDB
-    const payload = new WebhookPayload({ payload: req.body });
-    await payload.save();
+    const payload = req.body;
 
-    // Send Telegram notification
-    bot.sendMessage(chatId, `New webhook received: ${JSON.stringify(req.body)}`);
+    // Save raw payload to MongoDB
+    await WebhookPayload.create({
+      payload,
+      receivedAt: new Date(),
+    });
 
-    // Response
-    res.json({ status: "received" });
-  } catch (err) {
-    console.error("Webhook error ❌:", err);
-    res.status(500).json({ status: "error", error: err.message });
+    // Default message
+    let message = "📡 New webhook received";
+
+    // GitHub push formatting
+    if (payload.repository && payload.head_commit) {
+      const repo = payload.repository.name;
+      const author = payload.head_commit.author?.name || "Unknown";
+      const commitMessage = payload.head_commit.message;
+      const time = payload.head_commit.timestamp;
+
+      message =
+`🚀 GitHub Push Detected
+
+📦 Repo: ${repo}
+👤 Author: ${author}
+📝 Commit: ${commitMessage}
+🕒 Time: ${time}`;
+    }
+
+    // Send Telegram alert
+    await bot.sendMessage(process.env.CHAT_ID, message);
+
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error("Webhook error:", error);
+    res.status(500).json({ success: false });
   }
 });
 
-// ===== Start server =====
+// Start server
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
