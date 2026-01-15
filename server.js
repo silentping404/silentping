@@ -1,144 +1,190 @@
 require('dotenv').config();
-const express = require('express');
-const mongoose = require('mongoose');
 const TelegramBot = require('node-telegram-bot-api');
+const mongoose = require('mongoose');
+const axios = require('axios');
 
-const Subscriber = require('./models/Subscriber');
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+const MONGO_URI = process.env.MONGO_URI;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-const app = express();
-app.use(express.json());
+// ---------------- BOT ----------------
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+console.log('🚀 AI Writing Bot is running...');
 
-// =======================
-// MongoDB
-// =======================
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('MongoDB connected ✅'))
-  .catch(err => console.error('MongoDB error:', err));
-
-// =======================
-// Telegram Bot (POLLING ONLY)
-// =======================
-const bot = new TelegramBot(process.env.BOT_TOKEN, {
-  polling: {
-    interval: 300,
-    autoStart: true
-  }
-});
-
-console.log('Telegram bot polling started ✅');
-
-// =======================
-// Helper
-// =======================
-function addDays(date, days) {
-  const result = new Date(date);
-  result.setDate(result.getDate() + days);
-  return result;
-}
-
-// =======================
-// Telegram Commands
-// =======================
-bot.on('message', async (msg) => {
-  const chatId = msg.chat.id;
-  const text = msg.text?.trim();
-  const username = msg.from.username || 'unknown';
-
-  if (!text) return;
-
-  // /start
-  if (text === '/start') {
-    return bot.sendMessage(
-      chatId,
-      `👋 Welcome to SilentPing
-
-You’ll receive instant alerts when something happens.
-
-Commands:
-/subscribe — get payment instructions
-/verify — activate your subscription`
-    );
-  }
-
-  // /subscribe
-  if (text === '/subscribe') {
-    return bot.sendMessage(
-      chatId,
-      `💳 Subscription: 30 days
-
-Send *USDT (TRC20)* to this address:
-
-\`TMiPXEkHkXJs3yNDAJwNPJjBramhW4M6y2\`
-
-After sending payment, type:
-/verify`,
-      { parse_mode: 'Markdown' }
-    );
-  }
-
-  // /verify (MANUAL for now)
-  if (text === '/verify') {
-    let user = await Subscriber.findOne({ chatId });
-
-    const expiresAt = addDays(new Date(), 30);
-
-    if (!user) {
-      user = new Subscriber({
-        chatId,
-        username,
-        subscriptionActive: true,
-        expiresAt
-      });
-    } else {
-      user.subscriptionActive = true;
-      user.expiresAt = expiresAt;
-    }
-
-    await user.save();
-
-    return bot.sendMessage(
-      chatId,
-      `✅ Subscription activated!
-
-Valid until:
-📅 ${expiresAt.toDateString()}`
-    );
-  }
-
-  // Unknown command
-  bot.sendMessage(chatId, '❓ Unknown command. Use /start');
-});
-
-// =======================
-// Protected Webhook Endpoint
-// =======================
-app.post('/api/webhook', async (req, res) => {
-  const apiKey = req.headers['x-api-key'];
-  if (apiKey !== process.env.MASTER_API_KEY) {
-    return res.status(401).json({ success: false });
-  }
-
-  const now = new Date();
-
-  const activeSubscribers = await Subscriber.find({
-    subscriptionActive: true,
-    expiresAt: { $gt: now }
+// ---------------- DB ----------------
+mongoose.connect(MONGO_URI)
+  .then(() => console.log('✅ MongoDB connected'))
+  .catch(err => {
+    console.error('❌ MongoDB error:', err.message);
+    process.exit(1);
   });
 
-  for (const sub of activeSubscribers) {
-    bot.sendMessage(
-      sub.chatId,
-      `🚨 New Event Received:\n\n${JSON.stringify(req.body, null, 2)}`
+const userSchema = new mongoose.Schema({
+  telegramId: { type: String, unique: true },
+  balance: { type: Number, default: 0 }
+});
+
+const User = mongoose.model('User', userSchema);
+
+// ---------------- HELPERS ----------------
+async function getUser(telegramId) {
+  let user = await User.findOne({ telegramId });
+  if (!user) {
+    try {
+      user = await User.create({ telegramId });
+    } catch {
+      user = await User.findOne({ telegramId });
+    }
+  }
+  return user;
+}
+
+const PLANS = {
+  short: { credits: 5, words: 300 },
+  medium: { credits: 9, words: 600 },
+  long: { credits: 16, words: 1200 },
+  verylong: { credits: 25, words: 2000 }
+};
+
+async function generateAI(prompt, maxTokens) {
+  const res = await axios.post(
+    'https://api.openai.com/v1/chat/completions',
+    {
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: maxTokens
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    }
+  );
+
+  return res.data.choices[0].message.content;
+}
+
+// ---------------- COMMANDS ----------------
+
+// START
+bot.onText(/\/start/, async (msg) => {
+  await getUser(msg.from.id.toString());
+
+  bot.sendMessage(
+    msg.chat.id,
+`✨ *AI Writing Assistant*
+
+High-quality content delivered instantly.
+
+📌 *Commands*
+/order – Generate content
+/buy – Buy credits
+/balance – Check balance
+
+💡 Example:
+\`/order short Write about AI in business\``,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// BALANCE
+bot.onText(/\/balance/, async (msg) => {
+  const user = await getUser(msg.from.id.toString());
+  bot.sendMessage(
+    msg.chat.id,
+    `💰 *Your Balance*: ${user.balance} credits`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// BUY
+bot.onText(/\/buy/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+`💳 *Buy Credits*
+
+📦 *Plans*
+• Short (300 words) – 5 credits  
+• Medium (600 words) – 9 credits  
+• Long (1200 words) – 16 credits  
+• Very Long (2000 words) – 25 credits  
+
+💰 *Payment (TRC20)*
+\`TMiPXEkHkXJs3yNDAJwNPJjBramhW4M6y2\`
+
+After payment, contact admin.`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ORDER
+bot.onText(/\/order (\w+)\s+([\s\S]+)/, async (msg, match) => {
+  const planName = match[1].toLowerCase();
+  const prompt = match[2];
+  const user = await getUser(msg.from.id.toString());
+
+  if (!PLANS[planName]) {
+    return bot.sendMessage(
+      msg.chat.id,
+      '❌ Invalid plan. Use: short, medium, long, verylong'
     );
   }
 
-  res.json({ success: true });
+  const plan = PLANS[planName];
+
+  if (user.balance < plan.credits) {
+    return bot.sendMessage(
+      msg.chat.id,
+      `❌ Not enough credits. Required: ${plan.credits}`
+    );
+  }
+
+  const statusMsg = await bot.sendMessage(
+    msg.chat.id,
+    '⏳ *Generating your content...*',
+    { parse_mode: 'Markdown' }
+  );
+
+  try {
+    const content = await generateAI(
+      `${prompt}\n\nWrite approximately ${plan.words} words.`,
+      plan.words * 2
+    );
+
+    user.balance -= plan.credits;
+    await user.save();
+
+    await bot.editMessageText(
+      `✅ *Content Ready*\n\n${content}`,
+      {
+        chat_id: msg.chat.id,
+        message_id: statusMsg.message_id,
+        parse_mode: 'Markdown'
+      }
+    );
+  } catch (e) {
+    console.error(e.message);
+    bot.sendMessage(msg.chat.id, '⚠️ Error generating content.');
+  }
 });
 
-// =======================
-// Server
-// =======================
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// ADMIN: ADD BALANCE
+bot.onText(/\/addbalance (\d+) (\d+)/, async (msg, match) => {
+  if (msg.from.id.toString() !== ADMIN_CHAT_ID) {
+    return bot.sendMessage(msg.chat.id, '❌ Unauthorized');
+  }
+
+  const targetId = match[1];
+  const amount = parseInt(match[2]);
+
+  const user = await getUser(targetId);
+  user.balance += amount;
+  await user.save();
+
+  bot.sendMessage(
+    msg.chat.id,
+    `✅ Added ${amount} credits to ${targetId}`
+  );
 });
